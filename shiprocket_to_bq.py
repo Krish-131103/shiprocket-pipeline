@@ -489,6 +489,33 @@ def delete_date_from_bq(client: bigquery.Client, date_str: str) -> None:
     log.info("  Deleted existing rows for %s before re-fetch.", date_str)
 
 
+
+def dedup_raw_table(client: bigquery.Client) -> None:
+    """
+    Remove duplicate order_id rows from the raw orders table in-place.
+    Keeps the most recently assigned row (by awb_assign_date DESC).
+    Runs after every upload to keep the raw table clean.
+    """
+    table_ref = f"{GOOGLE_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+    query = f"""
+        CREATE OR REPLACE TABLE `{table_ref}` AS
+        SELECT * EXCEPT(_row_num)
+        FROM (
+          SELECT *,
+            ROW_NUMBER() OVER (
+              PARTITION BY order_id
+              ORDER BY awb_assign_date DESC, created_at DESC
+            ) AS _row_num
+          FROM `{table_ref}`
+        )
+        WHERE _row_num = 1
+    """
+    log.info("Deduplicating raw orders table …")
+    client.query(query).result()
+    log.info("Deduplication complete. Rows in table: %d",
+             client.get_table(table_ref).num_rows)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -512,7 +539,7 @@ def main():
 
     # BACKFILL MODE: table is empty or we force a full reload
     # Change BACKFILL_FROM to your actual first order date
-    BACKFILL_FROM = date(2026, 5, 4)   # ← adjust this to your go-live date
+    BACKFILL_FROM = date(2026, 5, 1)   # ← adjust this to your go-live date
 
     if latest_date is None:
         # Table is empty → full backfill
@@ -568,6 +595,9 @@ def main():
 
     # ── Upload ────────────────────────────────────────────────────────────
     upload_to_bq(client, df, mode=upload_mode)
+
+    # ── Deduplicate raw table after every upload ──────────────────────────
+    dedup_raw_table(client)
     log.info("Pipeline finished successfully.")
 
 
