@@ -1,0 +1,39 @@
+name: Daily BigQuery Sync
+
+on:
+  schedule:
+    - cron: '30 1 * * *'  # 7:00 AM IST (UTC+5:30) every day
+  workflow_dispatch:        # allows manual trigger from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas google-cloud-bigquery \
+                      google-auth python-dotenv pyarrow db-dtypes pandas-gbq
+
+      - name: Write GCP credentials file
+        run: echo '${{ secrets.GCP_CREDENTIALS_JSON }}' > bq_credentials.json
+
+      - name: Create .env file
+        run: |
+          echo "SHIPROCKET_TOKEN=${{ secrets.SHIPROCKET_TOKEN }}" >> .env
+          echo "GOOGLE_PROJECT_ID=${{ secrets.GOOGLE_PROJECT_ID }}" >> .env
+          echo "BQ_DATASET=${{ secrets.BQ_DATASET }}" >> .env
+          echo "BQ_TABLE=${{ secrets.BQ_TABLE }}" >> .env
+          echo "GOOGLE_CREDENTIALS_PATH=bq_credentials.json" >> .env
+          echo "GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}" >> .env
+
+      - name: Run BigQuery sync
+        run: python shiprocket_to_bq.py

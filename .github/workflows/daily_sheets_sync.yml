@@ -1,0 +1,37 @@
+name: Daily Sheets Sync
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 7:30 AM IST — runs 30 min after BQ sync finishes
+  workflow_dispatch:        # allows manual trigger from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install gspread pandas google-cloud-bigquery \
+                      google-auth python-dotenv pyarrow db-dtypes
+
+      - name: Write GCP credentials file
+        run: echo '${{ secrets.GCP_CREDENTIALS_JSON }}' > bq_credentials.json
+
+      - name: Create .env file
+        run: |
+          echo "GOOGLE_PROJECT_ID=${{ secrets.GOOGLE_PROJECT_ID }}" >> .env
+          echo "BQ_DATASET=${{ secrets.BQ_DATASET }}" >> .env
+          echo "GOOGLE_CREDENTIALS_PATH=bq_credentials.json" >> .env
+          echo "GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}" >> .env
+
+      - name: Run Sheets sync
+        run: python bq_to_sheets.py
