@@ -1,0 +1,5 @@
+.env
+bq_credentials.json
+__pycache__/
+*.pyc
+*.csv

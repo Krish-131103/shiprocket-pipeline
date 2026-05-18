@@ -1,0 +1,14 @@
+import requests
+
+token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEwNDU3MjUyLCJzb3VyY2UiOiJzci1hdXRoLWludCIsImV4cCI6MTc3OTY5NDk0NiwianRpIjoiWllJaUV3c2dlbVVtZnNWYiIsImlhdCI6MTc3ODgzMDk0NiwiaXNzIjoiaHR0cHM6Ly9zci1hdXRoLnNoaXByb2NrZXQuaW4vYXV0aG9yaXplL3VzZXIiLCJuYmYiOjE3Nzg4MzA5NDYsImNpZCI6MzQ1NzAyNywidGMiOjM2MCwidmVyYm9zZSI6ZmFsc2UsInZlbmRvcl9pZCI6MCwidmVuZG9yX2NvZGUiOiIifQ.Y2e3PUBrSl2o8ITAI7LM7OumKQqvdBJE2FD28WpXAXc"
+
+response = requests.get(
+    "https://apiv2.shiprocket.in/v1/external/orders?per_page=1&page=1",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+)
+
+import json
+print(json.dumps(response.json(), indent=2))

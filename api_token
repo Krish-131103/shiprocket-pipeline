@@ -1,0 +1,14 @@
+import requests
+
+# Get token using API user credentials
+response = requests.post(
+    "https://apiv2.shiprocket.in/v1/external/auth/login",
+    json={
+        "email": "ashish@moxiebeauty.in",   # the one you just created
+        "password": "GE1TKrgEo!RE$7XMrZe41Q0Kd2UaU1NI"
+    }
+)
+token = response.json()["token"]
+headers = {"Authorization": f"Bearer {token}"}
+print("Token:", token)
+print("Status:", response.status_code)
