@@ -2,7 +2,7 @@ name: Daily BigQuery Sync
 
 on:
   schedule:
-    - cron: '30 1 * * *'  # 7:00 AM IST (UTC+5:30) every day
+    - cron: '31 18 * * *'  # 12:01 AM IST (UTC+5:30)
   workflow_dispatch:        # allows manual trigger from GitHub UI
 
 jobs:

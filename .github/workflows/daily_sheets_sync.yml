@@ -2,7 +2,7 @@ name: Daily Sheets Sync
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # 7:30 AM IST — runs 30 min after BQ sync finishes
+    - cron: '45 18 * * *'  # 12:15 AM IST (UTC+5:30)
   workflow_dispatch:        # allows manual trigger from GitHub UI
 
 jobs:
