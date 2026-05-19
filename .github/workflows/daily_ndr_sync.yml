@@ -1,0 +1,39 @@
+name: Daily NDR Sync
+
+on:
+  schedule:
+    - cron: '0 19 * * *'  # 12:30 AM IST — runs 30 min after BQ sync finishes
+  workflow_dispatch:        # allows manual trigger from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas google-cloud-bigquery \
+                      google-auth python-dotenv pyarrow db-dtypes pandas-gbq
+
+      - name: Write GCP credentials file
+        run: echo '${{ secrets.GCP_CREDENTIALS_JSON }}' > bq_credentials.json
+
+      - name: Create .env file
+        run: |
+          echo "SHIPROCKET_TOKEN=${{ secrets.SHIPROCKET_TOKEN }}" >> .env
+          echo "GOOGLE_PROJECT_ID=${{ secrets.GOOGLE_PROJECT_ID }}" >> .env
+          echo "BQ_DATASET=${{ secrets.BQ_DATASET }}" >> .env
+          echo "BQ_TABLE=${{ secrets.BQ_TABLE }}" >> .env
+          echo "GOOGLE_CREDENTIALS_PATH=bq_credentials.json" >> .env
+          echo "GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}" >> .env
+
+      - name: Run NDR sync
+        run: python ndr_to_bq.py
