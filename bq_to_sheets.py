@@ -5,14 +5,19 @@ Fetches order data for the past 15 days from BigQuery (orders_enriched view)
 and writes it into a worksheet named 'Last 15 Days Orders' in the specified
 Google Sheet.
 
-Run manually:         python bq_to_sheets.py
-Automated trigger:    Google Apps Script (see instructions below)
+Layout:
+  A1        = Last updated timestamp
+  B1:L1     = Headers (11 columns)
+  B2:L...   = Data rows
 
-.env file must contain the same values as shiprocket_to_bq.py:
-  GOOGLE_PROJECT_ID       – GCP project ID
-  BQ_DATASET              – BigQuery dataset name
-  GOOGLE_CREDENTIALS_PATH – Path to bq_credentials.json
-  GOOGLE_SHEET_ID         – The long ID from your Google Sheet URL
+Run manually:         python bq_to_sheets.py
+Automated trigger:    GitHub Actions (daily_sheets_sync.yml)
+
+.env file must contain:
+  GOOGLE_PROJECT_ID       - GCP project ID
+  BQ_DATASET              - BigQuery dataset name
+  GOOGLE_CREDENTIALS_PATH - Path to bq_credentials.json
+  GOOGLE_SHEET_ID         - The long ID from your Google Sheet URL
 """
 
 import os
@@ -44,8 +49,8 @@ BQ_DATASET              = os.getenv("BQ_DATASET")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "bq_credentials.json")
 GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID")
 
-WORKSHEET_NAME          = "Last 15 Days Orders"
-LOOKBACK_DAYS           = 15
+WORKSHEET_NAME = "Last 15 Days Orders"
+LOOKBACK_DAYS  = 15
 
 # ---------------------------------------------------------------------------
 # BigQuery query
@@ -53,15 +58,18 @@ LOOKBACK_DAYS           = 15
 
 QUERY = f"""
 SELECT
-  CAST(channel_order_id AS STRING)        AS order_id,
+  CAST(channel_order_id AS STRING)     AS order_id,
   awb,
-  channel_created_at              AS created_at,
+  channel_created_at                   AS created_at,
   status,
-  COALESCE(delivered_date, '')    AS delivered_date,
-  customer_pincode                AS address_pincode,
-  warehouse                       AS warehouse,
-  courier                           AS Delivery_Partner
-  FROM `{GOOGLE_PROJECT_ID}.{BQ_DATASET}.orders_enriched`
+  COALESCE(delivered_date, '')         AS delivered_date,
+  customer_pincode                     AS address_pincode,
+  warehouse,
+  courier                              AS delivery_partner,
+  COALESCE(ndr_1_date, '')             AS ndr_1_date,
+  COALESCE(ndr_1_reason, '')           AS ndr_1_remark,
+  COALESCE(ndr_2_date, '')             AS ndr_2_date
+FROM `{GOOGLE_PROJECT_ID}.{BQ_DATASET}.orders_enriched`
 WHERE
   PARSE_DATE(
     '%d %b %Y',
@@ -71,22 +79,30 @@ ORDER BY channel_created_at DESC
 """
 
 
+# ---------------------------------------------------------------------------
+# Fetch from BigQuery
+# ---------------------------------------------------------------------------
+
 def fetch_from_bq() -> pd.DataFrame:
-    log.info("Connecting to BigQuery …")
+    log.info("Connecting to BigQuery ...")
     credentials = service_account.Credentials.from_service_account_file(
         GOOGLE_CREDENTIALS_PATH,
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
     client = bigquery.Client(project=GOOGLE_PROJECT_ID, credentials=credentials)
 
-    log.info("Running query for last %d days …", LOOKBACK_DAYS)
+    log.info("Running query for last %d days ...", LOOKBACK_DAYS)
     df = client.query(QUERY).to_dataframe()
     log.info("Fetched %d rows from BigQuery.", len(df))
     return df
 
 
+# ---------------------------------------------------------------------------
+# Write to Google Sheets
+# ---------------------------------------------------------------------------
+
 def write_to_sheets(df: pd.DataFrame) -> None:
-    log.info("Authenticating with Google Sheets …")
+    log.info("Authenticating with Google Sheets ...")
     credentials = service_account.Credentials.from_service_account_file(
         GOOGLE_CREDENTIALS_PATH,
         scopes=[
@@ -95,41 +111,68 @@ def write_to_sheets(df: pd.DataFrame) -> None:
         ],
     )
 
-    gc     = gspread.authorize(credentials)
-    sheet  = gc.open_by_key(GOOGLE_SHEET_ID)
+    gc    = gspread.authorize(credentials)
+    sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
     # Get or create the worksheet
     try:
         ws = sheet.worksheet(WORKSHEET_NAME)
-        log.info("Found existing worksheet '%s'. Clearing it …", WORKSHEET_NAME)
+        log.info("Found existing worksheet '%s'. Clearing it ...", WORKSHEET_NAME)
         ws.clear()
     except gspread.exceptions.WorksheetNotFound:
-        log.info("Creating new worksheet '%s' …", WORKSHEET_NAME)
+        log.info("Creating new worksheet '%s' ...", WORKSHEET_NAME)
         ws = sheet.add_worksheet(title=WORKSHEET_NAME, rows=50000, cols=20)
 
-    # Convert all values to strings (Sheets doesn't like NaN or int64)
-    df = df.fillna("").astype(str)
+    # ── Step 1: Write timestamp in A1 ─────────────────────────────────────
+    timestamp = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    ws.update("A1", [[f"Last updated: {timestamp}"]])
 
-    # Build data: header row + data rows
-    headers = ["Order ID", "AWB", "Created At", "Status", "Delivered Date", "Address Pincode", "Warehouse", "Delivery Partner"]
-    data_rows = df.values.tolist()
-    all_rows  = [headers] + data_rows
+    # Format A1 — italic, muted
+    ws.format("A1", {
+        "textFormat": {
+            "italic": True,
+            "fontSize": 10,
+            "foregroundColor": {"red": 0.4, "green": 0.4, "blue": 0.4}
+        }
+    })
 
-    log.info("Writing %d rows to sheet …", len(data_rows))
-    ws.update(all_rows, value_input_option="RAW")
+    # ── Step 2: Write headers in B1:L1 ───────────────────────────────────
+    headers = [
+        "Order ID",
+        "AWB",
+        "Created At",
+        "Status",
+        "Delivered Date",
+        "Address Pincode",
+        "Warehouse",
+        "Delivery Partner",
+        "NDR 1 Date",
+        "NDR 1 Remark",
+        "NDR 2 Date",
+    ]
+    ws.update("B1", [headers])
 
-    # Format header row: bold + background color
-    ws.format("A1:H1", {
-        "textFormat":      {"bold": True, "fontSize": 11},
-        "backgroundColor": {"red": 0.22, "green": 0.46, "blue": 0.69},
+    # Format headers — bold + blue background + white text
+    ws.format("B1:L1", {
+        "textFormat": {
+            "bold": True,
+            "fontSize": 11,
+            "foregroundColor": {"red": 1, "green": 1, "blue": 1}
+        },
+        "backgroundColor":     {"red": 0.22, "green": 0.46, "blue": 0.69},
         "horizontalAlignment": "CENTER",
     })
-    # Format header text color to white
-    ws.format("A1:F1", {
-        "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
-    })
 
-    # Freeze header row
+    # ── Step 3: Write data rows starting from B2 ──────────────────────────
+    df = df.fillna("").astype(str)
+    data_rows = df.values.tolist()
+
+    if data_rows:
+        ws.update("B2", data_rows, value_input_option="RAW")
+
+    log.info("Writing %d rows to sheet ...", len(data_rows))
+
+    # ── Step 4: Freeze header row ─────────────────────────────────────────
     sheet.batch_update({
         "requests": [{
             "updateSheetProperties": {
@@ -142,11 +185,8 @@ def write_to_sheets(df: pd.DataFrame) -> None:
         }]
     })
 
-    # Add last updated timestamp in cell H1
-    timestamp = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    ws.update("O1", [[f"Last updated: {timestamp}"]])
-
-    log.info("✅ Sheet updated successfully: https://docs.google.com/spreadsheets/d/%s", GOOGLE_SHEET_ID)
+    log.info("Sheet updated: https://docs.google.com/spreadsheets/d/%s",
+             GOOGLE_SHEET_ID)
 
 
 # ---------------------------------------------------------------------------
