@@ -28,4 +28,4 @@ jobs:
           BQ_DATASET:           ${{ secrets.BQ_DATASET }}
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           DUMP_SHEET_ID:        ${{ secrets.DUMP_SHEET_ID }}
-        run: python shiprocket_api/bq_to_sheets_dump.py
+        run: python bq_to_sheets_monthly.py
