@@ -1,0 +1,31 @@
+name: Daily DUMP Sheets Sync
+
+on:
+  schedule:
+    # 1:00 AM IST daily (19:30 UTC) — runs after daily_bq_sync (18:31 UTC)
+    - cron: "30 19 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync-dump-sheet:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run DUMP sheets sync
+        env:
+          GOOGLE_PROJECT_ID:    ${{ secrets.GOOGLE_PROJECT_ID }}
+          BQ_DATASET:           ${{ secrets.BQ_DATASET }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          DUMP_SHEET_ID:        ${{ secrets.DUMP_SHEET_ID }}
+        run: python shiprocket_api/bq_to_sheets_dump.py
