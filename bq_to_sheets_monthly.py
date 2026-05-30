@@ -174,7 +174,7 @@ def ensure_headers(ws: gspread.Worksheet,
 
     log.info("Writing headers for %s %d starting at %s ...",
              month_name[month], year, header_cell)
-    ws.update(block_range(year, month, 1), [HEADERS])
+    ws.update([HEADERS], block_range(year, month, 1))
 
     # Bold headers
     c_end = c_start + DATA_COLS - 1
@@ -301,9 +301,18 @@ def append_new_rows(ws: gspread.Worksheet,
     next_row = len(col_vals) + 1            # 1-indexed row number
 
     start_cell = f"{col_letter(c_start)}{next_row}"
-    ws.update(start_cell, new_rows, value_input_option="USER_ENTERED")
-    log.info("Done. Rows written starting at %s.", start_cell)
 
+# Auto-expand sheet if new rows would exceed current grid limit
+    required_rows = next_row + len(new_rows) - 1
+    sheet_row_count = ws.row_count
+    if required_rows > sheet_row_count:
+        extra = required_rows - sheet_row_count + 5000  # add buffer
+        ws.add_rows(extra)
+        log.info("Expanded sheet by %d rows (new total: %d).",
+                extra, sheet_row_count + extra)
+
+    ws.update(new_rows, start_cell, value_input_option="USER_ENTERED")
+    log.info("Done. Rows written starting at %s.", start_cell)
 
 # ---------------------------------------------------------------------------
 # Main
