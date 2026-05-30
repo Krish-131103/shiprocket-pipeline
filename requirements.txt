@@ -6,3 +6,6 @@ google-auth
 python-dotenv
 pyarrow
 db-dtypes
+pandas-gbq
+gspread
+PyNaCl
