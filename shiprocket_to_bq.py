@@ -551,7 +551,7 @@ def main():
     else:
         # Table has data → incremental mode
         # Fetch yesterday + today (yesterday's statuses may have changed)
-        fetch_start      = latest_date - timedelta(days=15)  # 15-day lookback for status updates
+        fetch_start      = latest_date - timedelta(days=40)  # 15-day lookback for status updates
         upload_mode      = "WRITE_APPEND"
         days_to_refresh  = [
             (fetch_start + timedelta(days=i)).strftime("%Y-%m-%d")
