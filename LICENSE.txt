@@ -1,0 +1,11 @@
+Copyright (c) 2024 Moxie Beauty. All rights reserved.
+
+This source code is made available for transparency and reference purposes only.
+
+You may view this code. You may NOT:
+- Use it in your own projects or products
+- Copy, modify, or distribute it
+- Use it for commercial purposes
+- Deploy it as part of any system without explicit written permission
+
+For permissions, contact: krishna@moxiebeauty.in
