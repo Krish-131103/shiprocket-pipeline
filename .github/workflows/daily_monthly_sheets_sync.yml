@@ -1,8 +1,8 @@
-name: Daily DUMP Sheets Sync
+name: Daily Monthly Sheets Sync
 
 on:
   schedule:
-    # 1:00 AM IST daily (19:30 UTC) — runs after daily_bq_sync (18:31 UTC)
+    # 1:00 AM IST daily (19:30 UTC) — after daily_bq_sync (18:31 UTC)
     - cron: "30 19 * * *"
   workflow_dispatch:
 
@@ -22,10 +22,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run DUMP sheets sync
+      - name: Run DUMP daily incremental sync
         env:
           GOOGLE_PROJECT_ID:    ${{ secrets.GOOGLE_PROJECT_ID }}
           BQ_DATASET:           ${{ secrets.BQ_DATASET }}
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           DUMP_SHEET_ID:        ${{ secrets.DUMP_SHEET_ID }}
-        run: python bq_to_sheets_monthly.py
+        run: python bq_to_sheets_dump_daily.py

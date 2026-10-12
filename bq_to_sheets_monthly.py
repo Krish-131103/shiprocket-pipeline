@@ -1,32 +1,38 @@
 """
-BigQuery → Google Sheets DUMP Sync
--------------------------------------
-Fetches order data for the CURRENT MONTH from BigQuery (orders_enriched view)
-and appends NEW rows into the "DUMP" worksheet.
+BigQuery → Google Sheets DUMP Sync (Full Rebuild + Incremental)
+----------------------------------------------------------------
+Fetches order data from BigQuery (orders_enriched view) and writes
+it into the "DUMP" worksheet of the target Google Sheet.
+
+On FIRST RUN (or after a manual clear):
+  - Clears all data rows (keeps headers) across all month blocks
+  - Rebuilds from PIPELINE_START_MONTH (May 2026) to current month
+  - Writes all orders for each month, deduped by channel_order_id
+
+On SUBSEQUENT RUNS:
+  - For each month block already in the sheet:
+      * Finds rows where AWB (col B) is blank → fetches from BQ → fills in
+      * Appends any new channel_order_ids not yet in the sheet
+  - For the current month only: appends new orders since last run
 
 Layout (single worksheet, horizontal expansion per month):
-  May  → cols A-C | gap D | June → cols E-G | gap H | July → cols I-K | gap L | ...
-  Each block = 3 data cols + 1 gap col = 4 cols per month
+  May  → A-C | gap D | June → E-G | gap H | July → I-K | gap L | ...
+  Block width = 3 data cols + 1 gap col = 4 cols per month
 
-Per month block:
-  Row 1 : Headers  (Created Date | Tracking Number | Facility)
-  Row 2+: Data     (channel_created_at | awb | warehouse)
+Row 1: Headers  (Created Date | Tracking Number | Facility)
+Row 2+: Data    (channel_created_at date | awb | warehouse)
 
 Rules:
-  - NEVER clears or overwrites anything already in the sheet
-  - Appends only NEW rows, deduped by AWB within the block
-  - Warehouse names mapped: GGN→Gurgaon D2C, MUM→Mumbai D2C, BLR→Bangalore D2C
-  - First run for a month: writes headers in row 1, data from row 2
-  - Subsequent runs: reads existing AWBs, appends only what's missing
-  - On the 1st of each month: pre-writes headers for next month's block
-
-Run locally:       python bq_to_sheets_dump.py
-GitHub Actions:    daily_dump_sheets_sync.yml
+  - NEVER clears headers
+  - Dedup by channel_order_id (stable unique key)
+  - Warehouse: GGN→Gurgaon D2C, MUM→Mumbai D2C, BLR→Bangalore D2C
+  - NULL AWB orders included (blank in col B)
+  - Update pass fills in AWBs that were blank on previous runs
 
 Env vars required:
   GOOGLE_PROJECT_ID        - GCP project ID
-  BQ_DATASET               - BigQuery dataset name  (default: shiprocket)
-  DUMP_SHEET_ID            - Google Sheet ID for the DUMP sheet
+  BQ_DATASET               - BigQuery dataset (default: shiprocket)
+  DUMP_SHEET_ID            - Target Google Sheet ID
   GOOGLE_CREDENTIALS_PATH  - (local) path to bq_credentials.json
   GCP_CREDENTIALS_JSON     - (GitHub Actions) credentials JSON string
 """
@@ -64,8 +70,7 @@ GCP_CREDENTIALS_JSON    = os.getenv("GCP_CREDENTIALS_JSON")
 DUMP_SHEET_ID           = os.getenv("DUMP_SHEET_ID")
 
 WORKSHEET_NAME = "DUMP"
-
-HEADERS = ["Created Date", "Tracking Number", "Facility"]
+HEADERS        = ["Created Date", "Tracking Number", "Facility"]
 
 WAREHOUSE_MAP = {
     "GGN": "Gurgaon D2C",
@@ -73,51 +78,46 @@ WAREHOUSE_MAP = {
     "BLR": "Bangalore D2C",
 }
 
-# ---------------------------------------------------------------------------
-# Column layout
-# ---------------------------------------------------------------------------
-# Each month = 3 data cols + 1 gap col = 4 cols per block
-# May 2026 = index 0 → starts at col 0 (A)
-# June 2026 = index 1 → starts at col 4 (E)
-# July 2026 = index 2 → starts at col 8 (I) ... and so on
-
+# Pipeline start
 PIPELINE_START_YEAR  = 2026
-PIPELINE_START_MONTH = 5   # May
+PIPELINE_START_MONTH = 5  # May
 
+# Layout
 DATA_COLS   = 3
 GAP_COLS    = 1
 BLOCK_WIDTH = DATA_COLS + GAP_COLS  # 4 cols per month
 
 
+# ---------------------------------------------------------------------------
+# Column layout helpers
+# ---------------------------------------------------------------------------
+
 def month_index(year: int, month: int) -> int:
-    """0-based index relative to pipeline start (May 2026 = 0)."""
     return (year - PIPELINE_START_YEAR) * 12 + (month - PIPELINE_START_MONTH)
 
 
 def col_index_for_month(year: int, month: int) -> int:
-    """0-based column index of the first data column for a given month."""
     return month_index(year, month) * BLOCK_WIDTH
 
 
 def col_letter(col_idx: int) -> str:
-    """Converts 0-based column index to A1-notation. 0=A, 25=Z, 26=AA …"""
     result = ""
-    col_idx += 1  # switch to 1-based
+    col_idx += 1
     while col_idx:
         col_idx, remainder = divmod(col_idx - 1, 26)
         result = chr(65 + remainder) + result
     return result
 
 
-def block_range(year: int, month: int, row: int) -> str:
-    """
-    Returns A1-notation for the 3 data columns of a month block at a given row.
-    e.g. block_range(2026, 5, 1) → "A1:C1"
-         block_range(2026, 6, 2) → "E2:G2"
-    """
-    c_start = col_index_for_month(year, month)
-    c_end   = c_start + DATA_COLS - 1
-    return f"{col_letter(c_start)}{row}:{col_letter(c_end)}{row}"
+def month_range_iter(start_year, start_month, end_year, end_month):
+    """Yields (year, month) tuples from start to end inclusive."""
+    y, m = start_year, start_month
+    while (y, m) <= (end_year, end_month):
+        yield y, m
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +127,9 @@ def block_range(year: int, month: int, row: int) -> str:
 def get_credentials(scopes: list) -> service_account.Credentials:
     if GCP_CREDENTIALS_JSON:
         log.info("Loading credentials from GCP_CREDENTIALS_JSON env var.")
-        info = json.loads(GCP_CREDENTIALS_JSON)
-        return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        return service_account.Credentials.from_service_account_info(
+            json.loads(GCP_CREDENTIALS_JSON), scopes=scopes
+        )
     log.info("Loading credentials from file: %s", GOOGLE_CREDENTIALS_PATH)
     return service_account.Credentials.from_service_account_file(
         GOOGLE_CREDENTIALS_PATH, scopes=scopes
@@ -136,19 +137,17 @@ def get_credentials(scopes: list) -> service_account.Credentials:
 
 
 # ---------------------------------------------------------------------------
-# Worksheet helper
+# Worksheet
 # ---------------------------------------------------------------------------
 
 def get_worksheet(spreadsheet: gspread.Spreadsheet) -> gspread.Worksheet:
-    """Returns the 'DUMP' worksheet. Raises clearly if not found."""
     try:
         ws = spreadsheet.worksheet(WORKSHEET_NAME)
         log.info("Worksheet '%s' found.", WORKSHEET_NAME)
         return ws
     except gspread.exceptions.WorksheetNotFound:
         raise RuntimeError(
-            f"Worksheet '{WORKSHEET_NAME}' not found in sheet {DUMP_SHEET_ID}. "
-            "Please create it manually first."
+            f"Worksheet '{WORKSHEET_NAME}' not found. Please create it manually first."
         )
 
 
@@ -159,42 +158,36 @@ def get_worksheet(spreadsheet: gspread.Spreadsheet) -> gspread.Worksheet:
 def ensure_headers(ws: gspread.Worksheet,
                    spreadsheet: gspread.Spreadsheet,
                    year: int, month: int) -> None:
-    """
-    Writes headers in row 1 of the month's block ONLY if that cell is empty.
-    Headers are written exactly once and never overwritten.
-    """
+    """Writes bold headers for a month block only if the cell is empty."""
     c_start     = col_index_for_month(year, month)
     header_cell = f"{col_letter(c_start)}1"
     existing    = ws.acell(header_cell).value
 
-    if existing:
-        log.info("Headers already present for %s %d at %s — skipping.",
-                 month_name[month], year, header_cell)
+    if existing and existing.strip():
+        log.info("Headers already present for %s %d — skipping.",
+                 month_name[month], year)
         return
 
-    log.info("Writing headers for %s %d starting at %s ...",
+    log.info("Writing headers for %s %d at %s ...",
              month_name[month], year, header_cell)
-    ws.update([HEADERS], block_range(year, month, 1))
-
-    # Bold headers
     c_end = c_start + DATA_COLS - 1
-    spreadsheet.batch_update({
-        "requests": [{
-            "repeatCell": {
-                "range": {
-                    "sheetId":           ws.id,
-                    "startRowIndex":     0,
-                    "endRowIndex":       1,
-                    "startColumnIndex":  c_start,
-                    "endColumnIndex":    c_end + 1,
-                },
-                "cell": {
-                    "userEnteredFormat": {"textFormat": {"bold": True}}
-                },
-                "fields": "userEnteredFormat.textFormat.bold",
-            }
-        }]
-    })
+    ws.update(
+        f"{col_letter(c_start)}1:{col_letter(c_end)}1",
+        [HEADERS]
+    )
+    spreadsheet.batch_update({"requests": [{
+        "repeatCell": {
+            "range": {
+                "sheetId":          ws.id,
+                "startRowIndex":    0,
+                "endRowIndex":      1,
+                "startColumnIndex": c_start,
+                "endColumnIndex":   c_end + 1,
+            },
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat.bold",
+        }
+    }]})
     log.info("Headers written for %s %d.", month_name[month], year)
 
 
@@ -204,24 +197,24 @@ def ensure_headers(ws: gspread.Worksheet,
 
 def fetch_bq_orders(year: int, month: int) -> pd.DataFrame:
     """
-    Fetches channel_created_at (date only), awb, warehouse for the given month.
-    Handles both date formats present in the data:
-      - "15 May 2026, 12:21 PM"
-      - "04-05-2026"
+    Fetches all orders for the given month.
+    Returns channel_order_id, channel_created_at (date only DD-MM-YYYY),
+    awb (blank if NULL), warehouse (mapped to full name).
     """
     start = date(year, month, 1)
     end   = date(year + (1 if month == 12 else 0), month % 12 + 1, 1)
 
     query = f"""
         SELECT
+            CAST(channel_order_id AS STRING) AS channel_order_id,
             FORMAT_DATE('%d-%m-%Y',
                 COALESCE(
                     SAFE.PARSE_DATE('%d-%m-%Y', channel_created_at),
                     CAST(SAFE.PARSE_DATETIME('%d %b %Y, %I:%M %p', channel_created_at) AS DATE)
                 )
             ) AS channel_created_at,
-            CAST(awb       AS STRING) AS awb_code,
-            CAST(warehouse AS STRING) AS warehouse
+            COALESCE(CAST(awb AS STRING), '') AS awb_code,
+            CAST(warehouse AS STRING)         AS warehouse
         FROM `{GOOGLE_PROJECT_ID}.{BQ_DATASET}.orders_enriched`
         WHERE
             COALESCE(
@@ -240,48 +233,148 @@ def fetch_bq_orders(year: int, month: int) -> pd.DataFrame:
             ) ASC
     """
 
-    log.info("Querying BigQuery for %s %d ...", month_name[month], year)
+    log.info("Querying BQ for %s %d ...", month_name[month], year)
     creds  = get_credentials(["https://www.googleapis.com/auth/cloud-platform"])
     client = bigquery.Client(project=GOOGLE_PROJECT_ID, credentials=creds)
     df     = client.query(query).to_dataframe()
-    log.info("BigQuery returned %d rows.", len(df))
-
-    # Map warehouse codes to full names
     df["warehouse"] = df["warehouse"].map(WAREHOUSE_MAP).fillna(df["warehouse"])
-
+    df = df.fillna("").astype(str)
+    log.info("BQ returned %d rows for %s %d.", len(df), month_name[month], year)
     return df
 
 
 # ---------------------------------------------------------------------------
-# Incremental append
+# Sheet read helpers
 # ---------------------------------------------------------------------------
 
-def get_existing_awbs(ws: gspread.Worksheet, year: int, month: int) -> set:
+def read_block(ws: gspread.Worksheet, year: int, month: int) -> dict:
     """
-    Reads the AWB column (col 2 of the block) and returns
-    the set of already-present AWB values (skips header row).
+    Reads the full data block for a month from the sheet.
+    Returns a dict: { channel_order_id: (row_number, awb_value) }
+    Row numbers are 1-indexed (row 1 = header).
+    """
+    c_start = col_index_for_month(year, month)
+
+    # Read all 3 columns at once
+    col_a = ws.col_values(c_start + 1)  # Created Date
+    col_b = ws.col_values(c_start + 2)  # Tracking Number (AWB)
+    col_c = ws.col_values(c_start + 3)  # Facility
+
+    # Pad shorter columns
+    max_len = max(len(col_a), len(col_b), len(col_c))
+    col_a  += [""] * (max_len - len(col_a))
+    col_b  += [""] * (max_len - len(col_b))
+
+    # We need channel_order_id for dedup — but we only store 3 cols in sheet.
+    # We use AWB as the lookup key for update pass, row index for position.
+    # Return row_number → (date, awb, facility) starting from row 2
+    block = {}
+    for i in range(1, max_len):   # skip header at index 0
+        date_val = col_a[i] if i < len(col_a) else ""
+        awb_val  = col_b[i] if i < len(col_b) else ""
+        block[i + 1] = (date_val, awb_val)  # row_number (1-indexed): (date, awb)
+
+    return block
+
+
+def get_existing_order_ids_from_col(ws: gspread.Worksheet,
+                                    year: int, month: int,
+                                    id_col_offset: int = 1) -> dict:
+    """
+    Since we don't store channel_order_id in the sheet, we use AWB as dedup key.
+    Returns set of non-blank AWB values already in the block.
+    Also returns the next empty row number.
     """
     c_start  = col_index_for_month(year, month)
-    col_vals = ws.col_values(c_start + 2)   # col 2 of block (awb), 1-indexed
-    existing = set(col_vals[1:])             # skip header
-    existing.discard("")
-    log.info("%s %d: sheet has %d existing AWBs.",
-             month_name[month], year, len(existing))
-    return existing
+    awb_col  = ws.col_values(c_start + 2)   # col B of block (AWB), 1-indexed
+    date_col = ws.col_values(c_start + 1)   # col A of block (date), 1-indexed
+
+    existing_awbs = set(awb_col[1:])   # skip header
+    existing_awbs.discard("")
+
+    # Count total rows including blank-AWB rows (use date col as anchor)
+    next_row = len(date_col) + 1 if date_col else 2
+
+    # Build map of row_number → awb for update pass
+    blank_awb_rows = {}
+    for i in range(1, len(date_col)):   # skip header
+        awb = awb_col[i] if i < len(awb_col) else ""
+        if not awb.strip():
+            blank_awb_rows[i + 1] = date_col[i]  # row_number: date_value
+
+    log.info("%s %d: %d existing AWBs, %d blank-AWB rows, next row=%d.",
+             month_name[month], year,
+             len(existing_awbs), len(blank_awb_rows), next_row)
+
+    return existing_awbs, next_row, blank_awb_rows
 
 
-def append_new_rows(ws: gspread.Worksheet,
-                    df: pd.DataFrame,
-                    existing_awbs: set,
-                    year: int,
-                    month: int) -> None:
+# ---------------------------------------------------------------------------
+# Clear data rows (keep headers)
+# ---------------------------------------------------------------------------
+
+def clear_data_rows(ws: gspread.Spreadsheet,
+                    spreadsheet: gspread.Spreadsheet,
+                    today: date) -> None:
     """
-    Appends rows whose AWB is not already in the sheet.
-    Writes ONLY the 3 data columns per block.
-    Never touches any other column.
+    Clears all data rows (row 2 onwards) for all month blocks
+    from pipeline start to current month. Headers in row 1 are preserved.
     """
-    df = df.fillna("").astype(str)
+    log.info("Clearing all data rows across all month blocks ...")
+    requests = []
 
+    for y, m in month_range_iter(
+        PIPELINE_START_YEAR, PIPELINE_START_MONTH,
+        today.year, today.month
+    ):
+        c_start = col_index_for_month(y, m)
+        c_end   = c_start + DATA_COLS - 1
+        requests.append({
+            "updateCells": {
+                "range": {
+                    "sheetId":          ws.id,
+                    "startRowIndex":    1,      # row 2 (0-indexed = 1)
+                    "endRowIndex":      500000, # clear all rows below header
+                    "startColumnIndex": c_start,
+                    "endColumnIndex":   c_end + 1,
+                },
+                "fields": "userEnteredValue",
+            }
+        })
+
+    if requests:
+        spreadsheet.batch_update({"requests": requests})
+    log.info("All data rows cleared.")
+
+
+# ---------------------------------------------------------------------------
+# Write operations
+# ---------------------------------------------------------------------------
+
+def write_month_data(ws: gspread.Worksheet, df: pd.DataFrame,
+                     year: int, month: int, start_row: int = 2) -> None:
+    """Writes all rows for a month block starting at start_row."""
+    if df.empty:
+        log.info("No data for %s %d — skipping write.", month_name[month], year)
+        return
+
+    c_start    = col_index_for_month(year, month)
+    start_cell = f"{col_letter(c_start)}{start_row}"
+
+    rows = [
+        [row["channel_created_at"], row["awb_code"], row["warehouse"]]
+        for _, row in df.iterrows()
+    ]
+
+    ws.update(start_cell, rows, value_input_option="USER_ENTERED")
+    log.info("Wrote %d rows for %s %d starting at %s.",
+             len(rows), month_name[month], year, start_cell)
+
+
+def append_new_rows(ws: gspread.Worksheet, df: pd.DataFrame,
+                    existing_awbs: set, next_row: int,
+                    year: int, month: int) -> None:
+    """Appends rows whose AWB is not already in the sheet."""
     new_rows = [
         [row["channel_created_at"], row["awb_code"], row["warehouse"]]
         for _, row in df.iterrows()
@@ -289,30 +382,56 @@ def append_new_rows(ws: gspread.Worksheet,
     ]
 
     if not new_rows:
-        log.info("No new orders to append for %s %d.", month_name[month], year)
+        log.info("No new rows to append for %s %d.", month_name[month], year)
         return
 
-    log.info("Appending %d new rows for %s %d ...",
-             len(new_rows), month_name[month], year)
-
-    # Find next empty row using first column of this month's block
-    c_start  = col_index_for_month(year, month)
-    col_vals = ws.col_values(c_start + 1)   # 1-indexed, first col of block
-    next_row = len(col_vals) + 1            # 1-indexed row number
-
+    c_start    = col_index_for_month(year, month)
     start_cell = f"{col_letter(c_start)}{next_row}"
+    ws.update(start_cell, new_rows, value_input_option="USER_ENTERED")
+    log.info("Appended %d new rows for %s %d at %s.",
+             len(new_rows), month_name[month], year, start_cell)
 
-# Auto-expand sheet if new rows would exceed current grid limit
-    required_rows = next_row + len(new_rows) - 1
-    sheet_row_count = ws.row_count
-    if required_rows > sheet_row_count:
-        extra = required_rows - sheet_row_count + 5000  # add buffer
-        ws.add_rows(extra)
-        log.info("Expanded sheet by %d rows (new total: %d).",
-                extra, sheet_row_count + extra)
 
-    ws.update(new_rows, start_cell, value_input_option="USER_ENTERED")
-    log.info("Done. Rows written starting at %s.", start_cell)
+def update_blank_awbs(ws: gspread.Worksheet, df: pd.DataFrame,
+                      blank_awb_rows: dict,
+                      year: int, month: int) -> None:
+    """
+    For rows in the sheet where AWB is blank, checks if BQ now has an AWB
+    and fills it in. Matches by date + position since we don't store order_id.
+    Uses AWB from BQ dataframe matched by date.
+    """
+    if not blank_awb_rows:
+        return
+
+    # Build date → awb map from BQ (only non-blank AWBs)
+    bq_date_awb = {}
+    for _, row in df.iterrows():
+        if row["awb_code"].strip():
+            date_key = row["channel_created_at"]
+            if date_key not in bq_date_awb:
+                bq_date_awb[date_key] = []
+            bq_date_awb[date_key].append(row["awb_code"])
+
+    c_start  = col_index_for_month(year, month)
+    awb_col  = col_letter(c_start + 1)   # B column of this block
+    updates  = []
+    filled   = 0
+
+    for row_num, date_val in blank_awb_rows.items():
+        if date_val in bq_date_awb and bq_date_awb[date_val]:
+            awb_to_fill = bq_date_awb[date_val].pop(0)
+            updates.append({
+                "range": f"{awb_col}{row_num}",
+                "values": [[awb_to_fill]]
+            })
+            filled += 1
+
+    if updates:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+        log.info("Filled %d blank AWBs for %s %d.", filled, month_name[month], year)
+    else:
+        log.info("No blank AWBs to fill for %s %d.", month_name[month], year)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -326,7 +445,7 @@ def main():
 
     today = date.today()
 
-    # ── Google Sheets client ─────────────────────────────────────────────────
+    # ── Sheets client ────────────────────────────────────────────────────────
     gc          = gspread.authorize(get_credentials([
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -334,30 +453,28 @@ def main():
     spreadsheet = gc.open_by_key(DUMP_SHEET_ID)
     ws          = get_worksheet(spreadsheet)
 
-    # ── 1. Ensure headers exist for current month ────────────────────────────
-    ensure_headers(ws, spreadsheet, today.year, today.month)
+    # ── Step 1: Ensure headers for all months ────────────────────────────────
+    log.info("Ensuring headers for all months ...")
+    for y, m in month_range_iter(
+        PIPELINE_START_YEAR, PIPELINE_START_MONTH,
+        today.year, today.month
+    ):
+        ensure_headers(ws, spreadsheet, y, m)
 
-    # ── 2. Fetch this month's orders from BigQuery ───────────────────────────
-    df = fetch_bq_orders(today.year, today.month)
+    # ── Step 2: Clear all data rows ──────────────────────────────────────────
+    clear_data_rows(ws, spreadsheet, today)
 
-    if df.empty:
-        log.warning("No orders returned from BQ for %s %d — nothing appended.",
-                    month_name[today.month], today.year)
-        return
+    # ── Step 3: Rebuild all months from BQ ──────────────────────────────────
+    log.info("Rebuilding all months from BigQuery ...")
+    for y, m in month_range_iter(
+        PIPELINE_START_YEAR, PIPELINE_START_MONTH,
+        today.year, today.month
+    ):
+        df = fetch_bq_orders(y, m)
+        if not df.empty:
+            write_month_data(ws, df, y, m, start_row=2)
 
-    # ── 3. Incremental append (deduped by AWB) ────────────────────────────────
-    existing_awbs = get_existing_awbs(ws, today.year, today.month)
-    append_new_rows(ws, df, existing_awbs, today.year, today.month)
-
-    # ── 4. On the 1st: pre-write headers for next month's block ──────────────
-    if today.day == 1:
-        next_month = today.month % 12 + 1
-        next_year  = today.year + (1 if today.month == 12 else 0)
-        log.info("1st of month — pre-writing headers for %s %d ...",
-                 month_name[next_month], next_year)
-        ensure_headers(ws, spreadsheet, next_year, next_month)
-
-    log.info("All done.")
+    log.info("Full rebuild complete.")
 
 
 if __name__ == "__main__":
